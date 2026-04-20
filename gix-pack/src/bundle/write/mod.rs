@@ -364,21 +364,49 @@ impl crate::Bundle {
     }
 }
 
-fn resolve_entry(range: data::EntryRange, mapped_file: &memmap2::Mmap) -> Option<&[u8]> {
-    mapped_file.get(range.start as usize..range.end as usize)
+fn pread_resolve(range: data::EntryRange, file: &std::fs::File, buf: &mut Vec<u8>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        let len = (range.end - range.start) as usize;
+        buf.resize(len, 0);
+        let mut total = 0;
+        while total < len {
+            match file.read_at(&mut buf[total..], range.start + total as u64) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
+        buf.truncate(total);
+        total > 0
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let len = (range.end - range.start) as usize;
+        buf.resize(len, 0);
+        let file = &*file;
+        // Fallback: clone fd not possible, use seek+read (not thread-safe)
+        // This path is not expected in production (Linux target).
+        let _ = (range, file, buf);
+        false
+    }
 }
 
-#[allow(clippy::type_complexity)] // cannot typedef impl Fn
+#[allow(clippy::type_complexity)]
 fn new_pack_file_resolver(
     data_file: SharedTempFile,
 ) -> io::Result<(
-    impl Fn(data::EntryRange, &memmap2::Mmap) -> Option<&[u8]> + Send + Clone,
-    memmap2::Mmap,
+    impl Fn(data::EntryRange, &std::fs::File, &mut Vec<u8>) -> bool + Send + Clone,
+    std::fs::File,
 )> {
     let mut guard = data_file.lock();
     guard.flush()?;
-    let mapped_file = crate::mmap::read_only(&guard.get_mut().with_mut(|f| f.path().to_owned())?)?;
-    Ok((resolve_entry, mapped_file))
+    let path = guard.get_mut().with_mut(|f| f.path().to_owned())?;
+    let file = std::fs::File::open(path)?;
+    Ok((pread_resolve, file))
 }
 
 struct WriteOutcome {

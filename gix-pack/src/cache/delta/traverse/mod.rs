@@ -117,9 +117,9 @@ pub struct Options<'a, 's> {
 impl Tree {
     /// Traverse this tree of delta objects, calling `sink` for each resolved object.
     ///
-    /// * `resolve(EntrySlice, &R) -> Option<&[u8]>` resolves the bytes in the pack for the given
-    ///   `EntrySlice`. It returns `Some(bytes)` if the object existed in the pack, or `None` to
-    ///   indicate a resolution error, which aborts the operation.
+    /// * `resolve(EntrySlice, &R, &mut Vec<u8>) -> bool` resolves the bytes in the pack for the
+    ///   given `EntrySlice`, writing them into the provided buffer. Returns `true` on success or
+    ///   `false` to indicate a resolution error, which aborts the operation.
     /// * `pack_entries_end` marks one-past-the-last byte of the last entry in the pack, as the
     ///   last entry's size would otherwise be unknown (it's not part of the index file).
     /// * `sink(offset, progress, context, accumulator)` is called exactly once per resolved
@@ -148,7 +148,7 @@ impl Tree {
         }: Options<'_, '_>,
     ) -> Result<Vec<A>, Error>
     where
-        F: for<'r> Fn(EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
+        F: Fn(EntryRange, &R, &mut Vec<u8>) -> bool + Send + Clone,
         R: Send + Sync,
         SINK: FnMut(crate::data::Offset, &dyn Progress, Context<'_>, &A) -> Result<(), E> + Send + Clone,
         E: std::error::Error + Send + Sync + 'static,
@@ -220,6 +220,7 @@ impl Tree {
                         spool: std::sync::Arc::clone(&spool),
                         sink: sink.clone(),
                         accumulator: new_accumulator(),
+                        read_cache: resolve::ReadCache::new(),
                     }
                 }
             },

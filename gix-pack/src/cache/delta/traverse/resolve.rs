@@ -23,6 +23,58 @@ use crate::{
 
 use super::spool::SpoolFile;
 
+pub(super) struct ReadCache {
+    buf: Vec<u8>,
+    buf_start: u64,
+    buf_valid: usize,
+}
+
+impl ReadCache {
+    const BATCH_SIZE: usize = 64 * 1024;
+
+    pub(super) fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(Self::BATCH_SIZE),
+            buf_start: u64::MAX,
+            buf_valid: 0,
+        }
+    }
+
+    pub(super) fn read<F, R>(
+        &mut self,
+        range: EntryRange,
+        resolve: &F,
+        resolve_data: &R,
+    ) -> Option<&[u8]>
+    where
+        F: Fn(EntryRange, &R, &mut Vec<u8>) -> bool,
+    {
+        let start = range.start;
+        let end = range.end;
+        let needed = (end - start) as usize;
+
+        if start >= self.buf_start && end <= self.buf_start + self.buf_valid as u64 {
+            let offset = (start - self.buf_start) as usize;
+            return Some(&self.buf[offset..offset + needed]);
+        }
+
+        let batch_end = start + needed.max(Self::BATCH_SIZE) as u64;
+        if !resolve(start..batch_end, resolve_data, &mut self.buf) || self.buf.len() < needed {
+            if !resolve(range.clone(), resolve_data, &mut self.buf) {
+                return None;
+            }
+        }
+        self.buf_start = start;
+        self.buf_valid = self.buf.len();
+
+        if needed <= self.buf_valid {
+            Some(&self.buf[..needed])
+        } else {
+            None
+        }
+    }
+}
+
 struct DecodedDelta {
     entry: data::Entry,
     entry_end: u64,
@@ -134,6 +186,7 @@ pub(super) struct State<'items, F, SINK, A> {
     pub memory_budget: MemoryBudget,
     pub spool: Arc<SpoolHandle>,
     pub accumulator: A,
+    pub read_cache: ReadCache,
 }
 
 #[allow(clippy::too_many_arguments, unsafe_code)]
@@ -152,6 +205,7 @@ pub(super) unsafe fn deltas<F, SINK, E, R, A>(
         memory_budget,
         spool,
         accumulator,
+        read_cache,
     }: &mut State<'_, F, SINK, A>,
     resolve_data: &R,
     hash_len: usize,
@@ -160,7 +214,7 @@ pub(super) unsafe fn deltas<F, SINK, E, R, A>(
 ) -> Result<(), Error>
 where
     R: Send + Sync,
-    F: for<'r> Fn(EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
+    F: Fn(EntryRange, &R, &mut Vec<u8>) -> bool + Send + Clone,
     SINK: FnMut(crate::data::Offset, &dyn Progress, Context<'_>, &A) -> Result<(), E> + Send + Clone,
     E: std::error::Error + Send + Sync + 'static,
     A: Send + Sync,
@@ -168,9 +222,11 @@ where
     let mut decompressed_bytes_by_pack_offset: BTreeMap<u64, DecodedDelta> = BTreeMap::new();
     let mut inflate = zlib::Inflate::default();
     let mut decompress_from_resolver = |slice: EntryRange, out: &mut Vec<u8>| -> Result<(data::Entry, u64), Error> {
-        let bytes = resolve(slice.clone(), resolve_data).ok_or(Error::ResolveFailed {
-            pack_offset: slice.start,
-        })?;
+        let bytes = read_cache
+            .read(slice.clone(), resolve, resolve_data)
+            .ok_or(Error::ResolveFailed {
+                pack_offset: slice.start,
+            })?;
         let entry = data::Entry::from_bytes(bytes, slice.start, hash_len)?;
         let compressed = &bytes[entry.header_size()..];
         let decompressed_len = entry.decompressed_size as usize;
@@ -314,7 +370,7 @@ fn deltas_mt<F, SINK, E, R, A>(
 ) -> Result<(), Error>
 where
     R: Send + Sync,
-    F: for<'r> Fn(EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
+    F: Fn(EntryRange, &R, &mut Vec<u8>) -> bool + Send + Clone,
     SINK: FnMut(crate::data::Offset, &dyn Progress, Context<'_>, &A) -> Result<(), E> + Send + Clone,
     E: std::error::Error + Send + Sync + 'static,
     A: Send + Sync,
@@ -345,11 +401,14 @@ where
                             let mut fully_resolved_delta_bytes = Vec::new();
                             let mut delta_bytes = Vec::new();
                             let mut inflate = zlib::Inflate::default();
+                            let mut read_cache = ReadCache::new();
                             let mut decompress_from_resolver =
                                 |slice: EntryRange, out: &mut Vec<u8>| -> Result<(data::Entry, u64), Error> {
-                                    let bytes = resolve(slice.clone(), resolve_data).ok_or(Error::ResolveFailed {
-                                        pack_offset: slice.start,
-                                    })?;
+                                    let bytes = read_cache
+                                        .read(slice.clone(), &resolve, resolve_data)
+                                        .ok_or(Error::ResolveFailed {
+                                            pack_offset: slice.start,
+                                        })?;
                                     let entry = data::Entry::from_bytes(bytes, slice.start, hash_len)?;
                                     let compressed = &bytes[entry.header_size()..];
                                     let decompressed_len = entry.decompressed_size as usize;

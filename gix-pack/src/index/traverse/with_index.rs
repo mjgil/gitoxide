@@ -116,7 +116,16 @@ impl index::File {
                 let num_nodes_counter = std::sync::atomic::AtomicU64::new(0);
                 let processor = std::sync::Mutex::new(processor);
                 tree.traverse(
-                    |slice, pack| pack.entry_slice(slice),
+                    |slice, pack: &crate::data::File, buf: &mut Vec<u8>| {
+                        match pack.entry_slice(slice) {
+                            Some(bytes) => {
+                                buf.clear();
+                                buf.extend_from_slice(bytes);
+                                true
+                            }
+                            None => false,
+                        }
+                    },
                     pack,
                     pack.pack_end() as u64,
                     |offset: crate::data::Offset,

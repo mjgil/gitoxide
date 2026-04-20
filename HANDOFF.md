@@ -112,6 +112,11 @@ several commits ahead of `origin/main` (not pushed).
 | `41eb2bd` | — | docs: update HANDOFF.md + MEASUREMENTS.md for step 5.5-d landing |
 | `ff4fedc` | 5.6-a | gix-pack: add sink callback to `Tree::traverse`; retire `Outcome<T>`. Threads a per-worker `FnMut(Offset, &T)` sink through `resolve::deltas`/`deltas_mt` and deletes the post-traversal `Vec<(Offset, T)>` partition; site 1 (index/write) wraps the sorter in a Mutex, site 2 (with_index) splits `digest_statistics` into an accumulator + finaliser. rust-lang/rust anon: 146 → 116 MiB at `--budget-mb 1` (-20.5%); elapsed essentially flat (+1.0% tight, +6.2% unlimited); no mid-implementation pivots |
 | `05bcaa9` | 5.6-b | gix-pack: retire T generic from Tree and data array from ItemStore. Merges `inspect_object` into the `sink` callback (option i from §8); Tree loses T generic; ItemStore, Node, State all become non-generic; DataSliceSync deleted. Site 1 (index/write) recomputes CRC32 from raw pack bytes via cloned resolver; site 2 (with_index) binary-searches sorted entries by offset. rust-lang/rust anon: unlimited 135 → 59 MiB (-56%); b=1 116 → 110 MiB (-5%); b=10 42 MiB. 3 lib tests retired (data array tests), 45/50/12/4 all green |
+| `276a41e` | 5.6-c | gix-pack: per-worker accumulator to `Tree::traverse`; batched sorter flush (1024-entry batches) |
+| `b17a238` | 5.6-d | gix-pack: `MAP_POPULATE` + `MADV_HUGEPAGE` for metadata mmaps; elapsed regression fully eliminated at unlimited |
+| `3e00a0d` | 5.6-e | gix-pack: `BufWriter` + cached offset in `ItemStoreBuilder`; write syscall reduction ~330× |
+| `c2449b0` | 5.6-f | gix-pack: defer `next_offset` writes to `finish()` via `MmapMut`; eliminates per-item seek-write-seek |
+| *pending* | 5.7 | gix-pack: replace mmap resolver with batched `pread(2)` — `peak_rss_mb` drops to near `peak_rss_anon_mb` levels. Resolve callback signature changes from `Fn(EntryRange, &R) -> Option<&[u8]>` to `Fn(EntryRange, &R, &mut Vec<u8>) -> bool`; per-thread `ReadCache` (64 KiB batch) amortizes syscalls; `new_pack_file_resolver` returns `std::fs::File` instead of `Mmap` |
 
 Commits come in two shapes: substantive code with tests, and
 docs-only. The docs commits are load-bearing — the measurement and
@@ -766,7 +771,7 @@ understand a commit from its message alone.
 
 ---
 
-**Last updated: step 5.6-e (BufWriter + cached offset).**
+**Last updated: step 5.7 (pread resolver — mmap elimination).**
 
 When modifying this file, keep the commit-history table (Section 4)
 current, update the current-status table (Section 3), and bump the

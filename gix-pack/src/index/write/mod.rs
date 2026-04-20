@@ -109,7 +109,7 @@ impl crate::index::File {
     where
         F: FnOnce() -> io::Result<(F2, R)>,
         R: Send + Sync,
-        F2: for<'r> Fn(crate::data::EntryRange, &'r R) -> Option<&'r [u8]> + Send + Sync + Clone,
+        F2: Fn(crate::data::EntryRange, &R, &mut Vec<u8>) -> bool + Send + Sync + Clone,
     {
         if version != crate::index::Version::default() {
             return Err(Error::Unsupported(version));
@@ -210,6 +210,7 @@ impl crate::index::File {
                     let sorter_ref = &sorter;
                     let pack_ref = &pack;
                     let resolver_ref = &resolver_for_crc;
+                    let mut crc_buf = Vec::new();
                     move |offset: crate::data::Offset,
                           _progress: &dyn gix_features::progress::Progress,
                           traverse::Context {
@@ -226,9 +227,10 @@ impl crate::index::File {
                             .expect("base object as source of iteration");
                         let id = gix_object::compute_hash(hash_kind, object_kind, bytes)
                             .map_err(std::io::Error::other)?;
-                        let raw_entry = resolver_ref(offset..entry_end, pack_ref)
-                            .expect("resolver must succeed for traversed entries");
-                        let crc32 = gix_features::hash::crc32(raw_entry);
+                        if !resolver_ref(offset..entry_end, pack_ref, &mut crc_buf) {
+                            return Err(std::io::Error::other("resolver must succeed for traversed entries"));
+                        }
+                        let crc32 = gix_features::hash::crc32(&crc_buf);
                         let mut buf = acc.lock()
                             .expect("batch buffer mutex must not be poisoned");
                         buf.push(IndexEntry { id, crc32, offset });

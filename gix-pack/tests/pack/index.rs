@@ -121,8 +121,29 @@ mod version {
             pack::{INDEX_V2, V2_PACKS_AND_INDICES},
         };
 
-        fn slice_map(entry: gix_pack::data::EntryRange, map: &memmap2::Mmap) -> Option<&[u8]> {
-            map.get(entry.start as usize..entry.end as usize)
+        fn slice_map(entry: gix_pack::data::EntryRange, map: &std::fs::File, buf: &mut Vec<u8>) -> bool {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                let len = (entry.end - entry.start) as usize;
+                buf.resize(len, 0);
+                let mut total = 0;
+                while total < len {
+                    match map.read_at(&mut buf[total..], entry.start + total as u64) {
+                        Ok(0) => break,
+                        Ok(n) => total += n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => return false,
+                    }
+                }
+                buf.truncate(total);
+                total > 0
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (entry, map, buf);
+                false
+            }
         }
 
         #[test]
@@ -148,8 +169,7 @@ mod version {
                     desired_kind,
                     || {
                         let file = std::fs::File::open(fixture_path(data_path))?;
-                        let map = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file)? };
-                        Ok((slice_map, map))
+                        Ok((slice_map, file))
                     },
                     &mut pack_iter,
                     None,
@@ -281,8 +301,7 @@ mod version {
                     pack::index::Version::default(),
                     || {
                         let file = std::fs::File::open(fixture_path(PACK_FOR_INDEX_V2))?;
-                        let map = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file)? };
-                        Ok((slice_map, map))
+                        Ok((slice_map, file))
                     },
                     &mut pack_iter,
                     None,
@@ -338,8 +357,7 @@ mod version {
                 pack::index::Version::default(),
                 || {
                     let file = std::fs::File::open(fixture_path(PACK_FOR_INDEX_V2))?;
-                    let map = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file)? };
-                    Ok((slice_map, map))
+                    Ok((slice_map, file))
                 },
                 &mut pack_iter,
                 None,

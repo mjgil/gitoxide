@@ -10,6 +10,7 @@ mod diff;
 mod head;
 mod id;
 mod init;
+mod memory_budget;
 mod object;
 mod reference;
 mod remote;

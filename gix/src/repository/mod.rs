@@ -42,6 +42,7 @@ mod impls;
 mod index;
 pub(crate) mod init;
 mod location;
+mod memory_budget;
 #[cfg(feature = "mailmap")]
 mod mailmap;
 ///

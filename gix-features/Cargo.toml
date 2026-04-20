@@ -84,6 +84,10 @@ name = "pipe"
 path = "tests/pipe.rs"
 required-features = ["io-pipe"]
 
+[[test]]
+name = "budget"
+path = "tests/budget.rs"
+
 [dependencies]
 gix-trace = { version = "^0.1.18", path = "../gix-trace" }
 

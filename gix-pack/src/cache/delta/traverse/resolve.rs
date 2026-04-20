@@ -1,128 +1,171 @@
 use std::{
     collections::BTreeMap,
-    sync::atomic::{AtomicBool, AtomicIsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicIsize, Ordering},
+        Arc,
+    },
 };
 
-use gix_features::{progress::Progress, threading, zlib};
+use gix_features::{
+    budget::{MemoryBudget, Reservation},
+    progress::Progress,
+    threading, zlib,
+};
 
 use crate::{
     cache::delta::{
-        traverse::{util::ItemSliceSync, Context, Error},
-        Item,
+        item_store::ItemMetadata,
+        traverse::{spool::SpoolHandle, Context, Error},
     },
     data,
     data::EntryRange,
 };
 
-mod root {
-    use crate::cache::delta::{traverse::util::ItemSliceSync, Item};
+use super::spool::SpoolFile;
 
-    /// An item returned by `iter_root_chunks`, allowing access to the `data` stored alongside nodes in a [`Tree`].
-    pub(crate) struct Node<'a, T: Send> {
-        // SAFETY INVARIANT: see Node::new(). That function is the only one used
-        // to create or modify these fields.
-        item: &'a mut Item<T>,
-        child_items: &'a ItemSliceSync<'a, Item<T>>,
+struct DecodedDelta {
+    entry: data::Entry,
+    entry_end: u64,
+    storage: DeltaStorage,
+}
+
+enum DeltaStorage {
+    InMemory {
+        bytes: Vec<u8>,
+        _reservation: Reservation,
+    },
+    Spilled {
+        spool: Arc<SpoolFile>,
+        offset: u64,
+        len: usize,
+    },
+}
+
+impl DecodedDelta {
+    fn store(
+        entry: data::Entry,
+        entry_end: u64,
+        bytes: Vec<u8>,
+        budget: &MemoryBudget,
+        spool_handle: &SpoolHandle,
+    ) -> Result<Self, Error> {
+        match budget.reserve(bytes.len()) {
+            Ok(reservation) => Ok(Self {
+                entry,
+                entry_end,
+                storage: DeltaStorage::InMemory {
+                    bytes,
+                    _reservation: reservation,
+                },
+            }),
+            Err(_out_of_budget) => {
+                let spool = spool_handle.get_or_create().map_err(Error::SpoolIo)?;
+                let len = bytes.len();
+                let offset = spool.append(&bytes).map_err(Error::SpoolIo)?;
+                drop(bytes);
+                Ok(Self {
+                    entry,
+                    entry_end,
+                    storage: DeltaStorage::Spilled { spool, offset, len },
+                })
+            }
+        }
     }
 
-    impl<'a, T: Send> Node<'a, T> {
-        /// SAFETY: `item.children` must uniquely reference elements in child_items that no other currently alive
-        /// item does. All child_items must also have unique children, unless the child_item is itself `item`,
-        /// in which case no other live item should reference it in its `item.children`.
-        ///
-        /// This safety invariant can be reliably upheld by making sure `item` comes from a Tree and `child_items`
-        /// was constructed using that Tree's child_items. This works since Tree has this invariant as well: all
-        /// child_items are referenced at most once (really, exactly once) by a node in the tree.
-        ///
-        /// Note that this invariant is a bit more relaxed than that on `deltas()`, because this function can be called
-        /// for traversal within a child item, which happens in into_child_iter()
+    fn into_parts(self) -> Result<(data::Entry, u64, Vec<u8>), Error> {
+        let bytes = match self.storage {
+            DeltaStorage::InMemory { bytes, .. } => bytes,
+            DeltaStorage::Spilled { spool, offset, len } => {
+                spool.read_exact(offset, len).map_err(Error::SpoolIo)?
+            }
+        };
+        Ok((self.entry, self.entry_end, bytes))
+    }
+}
+
+pub(crate) mod root {
+    use crate::cache::delta::item_store::ItemMetadata;
+
+    pub(crate) struct Node<'a> {
+        idx: u32,
+        metadata: &'a ItemMetadata<'a>,
+    }
+
+    impl<'a> Node<'a> {
         #[allow(unsafe_code)]
-        pub(super) unsafe fn new(item: &'a mut Item<T>, child_items: &'a ItemSliceSync<'a, Item<T>>) -> Self {
-            Node { item, child_items }
+        pub(super) unsafe fn new(
+            idx: u32,
+            metadata: &'a ItemMetadata<'a>,
+        ) -> Self {
+            Node { idx, metadata }
         }
     }
 
-    impl<'a, T: Send> Node<'a, T> {
-        /// Returns the offset into the pack at which the `Node`s data is located.
+    impl<'a> Node<'a> {
         pub fn offset(&self) -> u64 {
-            self.item.offset
+            self.metadata.offset(self.idx)
         }
 
-        /// Returns the slice into the data pack at which the pack entry is located.
         pub fn entry_slice(&self) -> crate::data::EntryRange {
-            self.item.offset..self.item.next_offset
+            self.metadata.offset(self.idx)..self.metadata.next_offset(self.idx)
         }
 
-        /// Returns the node data associated with this node.
-        pub fn data(&mut self) -> &mut T {
-            &mut self.item.data
-        }
-
-        /// Returns true if this node has children, e.g. is not a leaf in the tree.
         pub fn has_children(&self) -> bool {
-            !self.item.children().is_empty()
+            !self.metadata.children(self.idx).is_empty()
         }
 
-        /// Transform this `Node` into an iterator over its children.
-        ///
-        /// Children are `Node`s referring to pack entries whose base object is this pack entry.
-        pub fn into_child_iter(self) -> impl Iterator<Item = Node<'a, T>> + 'a {
-            let children = self.child_items;
+        pub fn into_child_iter(self) -> impl Iterator<Item = Node<'a>> + 'a {
+            let metadata = self.metadata;
             #[allow(unsafe_code)]
-            self.item.children().iter().map(move |&index| {
-                // SAFETY: Due to the invariant on new(), we can rely on these indices
-                // being unique.
-                let item = unsafe { children.get_mut(index as usize) };
-                // SAFETY: Since every child_item is also required to uphold the uniqueness guarantee,
-                // creating a Node with one of the child_items that we are allowed access to is still fine.
-                unsafe { Node::new(item, children) }
+            self.metadata.children(self.idx).iter().map(move |&child_idx| {
+                unsafe { Node::new(child_idx, metadata) }
             })
         }
     }
 }
 
-pub(super) struct State<'items, F, MBFN, T: Send> {
+pub(super) struct State<'items, F, SINK, A> {
     pub delta_bytes: Vec<u8>,
     pub fully_resolved_delta_bytes: Vec<u8>,
     pub progress: Box<dyn Progress>,
     pub resolve: F,
-    pub modify_base: MBFN,
-    pub child_items: &'items ItemSliceSync<'items, Item<T>>,
+    pub sink: SINK,
+    pub metadata: &'items ItemMetadata<'items>,
+    pub memory_budget: MemoryBudget,
+    pub spool: Arc<SpoolHandle>,
+    pub accumulator: A,
 }
 
-/// SAFETY: `item.children` must uniquely reference elements in child_items that no other currently alive
-/// item does. All child_items must also have unique children.
-///
-/// This safety invariant can be reliably upheld by making sure `item` comes from a Tree and `child_items`
-/// was constructed using that Tree's child_items. This works since Tree has this invariant as well: all
-/// child_items are referenced at most once (really, exactly once) by a node in the tree.
 #[allow(clippy::too_many_arguments, unsafe_code)]
-#[deny(unsafe_op_in_unsafe_fn)] // this is a big function, require unsafe for the one small unsafe op we have
-pub(super) unsafe fn deltas<T, F, MBFN, E, R>(
+#[deny(unsafe_op_in_unsafe_fn)]
+pub(super) unsafe fn deltas<F, SINK, E, R, A>(
     objects: gix_features::progress::StepShared,
     size: gix_features::progress::StepShared,
-    item: &mut Item<T>,
+    root_idx: &mut u32,
     State {
         delta_bytes,
         fully_resolved_delta_bytes,
         progress,
         resolve,
-        modify_base,
-        child_items,
-    }: &mut State<'_, F, MBFN, T>,
+        sink,
+        metadata,
+        memory_budget,
+        spool,
+        accumulator,
+    }: &mut State<'_, F, SINK, A>,
     resolve_data: &R,
     hash_len: usize,
     threads_left: &AtomicIsize,
     should_interrupt: &AtomicBool,
 ) -> Result<(), Error>
 where
-    T: Send,
     R: Send + Sync,
     F: for<'r> Fn(EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
-    MBFN: FnMut(&mut T, &dyn Progress, Context<'_>) -> Result<(), E> + Send + Clone,
+    SINK: FnMut(crate::data::Offset, &dyn Progress, Context<'_>, &A) -> Result<(), E> + Send + Clone,
     E: std::error::Error + Send + Sync + 'static,
+    A: Send + Sync,
 {
-    let mut decompressed_bytes_by_pack_offset = BTreeMap::new();
+    let mut decompressed_bytes_by_pack_offset: BTreeMap<u64, DecodedDelta> = BTreeMap::new();
     let mut inflate = zlib::Inflate::default();
     let mut decompress_from_resolver = |slice: EntryRange, out: &mut Vec<u8>| -> Result<(data::Entry, u64), Error> {
         let bytes = resolve(slice.clone(), resolve_data).ok_or(Error::ResolveFailed {
@@ -135,14 +178,11 @@ where
         Ok((entry, slice.end))
     };
 
-    // each node is a base, and its children always start out as deltas which become a base after applying them.
-    // These will be pushed onto our stack until all are processed
     let root_level = 0;
-    // SAFETY: This invariant is required from the caller
     #[allow(unsafe_code)]
-    let root_node = unsafe { root::Node::new(item, child_items) };
+    let root_node = unsafe { root::Node::new(*root_idx, metadata) };
     let mut nodes: Vec<_> = vec![(root_level, root_node)];
-    while let Some((level, mut base)) = nodes.pop() {
+    while let Some((level, base)) = nodes.pop() {
         if should_interrupt.load(Ordering::Relaxed) {
             return Err(Error::Interrupted);
         }
@@ -154,14 +194,13 @@ where
             decompressed_bytes_by_pack_offset
                 .remove(&base.offset())
                 .expect("we store the resolved delta buffer when done")
+                .into_parts()?
         };
 
-        // anything done here must be repeated further down for leaf-nodes.
-        // This way we avoid retaining their decompressed memory longer than needed (they have no children,
-        // thus their memory can be released right away, using 18% less peak memory on the linux kernel).
         {
-            modify_base(
-                base.data(),
+            let base_offset = base.offset();
+            sink(
+                base_offset,
                 progress,
                 Context {
                     entry: &base_entry,
@@ -169,13 +208,14 @@ where
                     decompressed: &base_bytes,
                     level,
                 },
+                accumulator,
             )
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
             objects.fetch_add(1, Ordering::Relaxed);
             size.fetch_add(base_bytes.len(), Ordering::Relaxed);
         }
 
-        for mut child in base.into_child_iter() {
+        for child in base.into_child_iter() {
             let (mut child_entry, entry_end) = decompress_from_resolver(child.entry_slice(), delta_bytes)?;
             let (base_size, consumed) = data::delta::decode_header_size(delta_bytes);
             let mut header_ofs = consumed;
@@ -192,16 +232,21 @@ where
 
             // FIXME: this actually invalidates the "pack_offset()" computation, which is not obvious to consumers
             //        at all
-            child_entry.header = base_entry.header; // assign the actual object type, instead of 'delta'
+            child_entry.header = base_entry.header;
             if child.has_children() {
-                decompressed_bytes_by_pack_offset.insert(
-                    child.offset(),
-                    (child_entry, entry_end, std::mem::take(fully_resolved_delta_bytes)),
-                );
+                let entry = DecodedDelta::store(
+                    child_entry,
+                    entry_end,
+                    std::mem::take(fully_resolved_delta_bytes),
+                    memory_budget,
+                    spool,
+                )?;
+                decompressed_bytes_by_pack_offset.insert(child.offset(), entry);
                 nodes.push((level + 1, child));
             } else {
-                modify_base(
-                    child.data(),
+                let child_offset = child.offset();
+                sink(
+                    child_offset,
                     &progress,
                     Context {
                         entry: &child_entry,
@@ -209,6 +254,7 @@ where
                         decompressed: fully_resolved_delta_bytes,
                         level: level + 1,
                     },
+                    accumulator,
                 )
                 .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
                 objects.fetch_add(1, Ordering::Relaxed);
@@ -216,17 +262,12 @@ where
             }
         }
 
-        // After the first round, see if we can use additional threads, and if so we enter multi-threaded mode.
-        // In it we will keep using new threads as they become available while using this thread for coordination.
-        // We optimize for a low memory footprint as we are likely to get here if long delta-chains with large objects are involved.
-        // Try to avoid going into threaded mode if there isn't more than one unit of work anyway.
         if nodes.len() > 1 {
             if let Ok(initial_threads) =
                 threads_left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |threads_available| {
                     (threads_available > 0).then_some(0)
                 })
             {
-                // Assure no memory is held here.
                 *delta_bytes = Vec::new();
                 *fully_resolved_delta_bytes = Vec::new();
                 return deltas_mt(
@@ -238,10 +279,13 @@ where
                     nodes,
                     resolve.clone(),
                     resolve_data,
-                    modify_base.clone(),
+                    sink.clone(),
                     hash_len,
                     threads_left,
                     should_interrupt,
+                    memory_budget.clone(),
+                    Arc::clone(spool),
+                    accumulator,
                 );
             }
         }
@@ -250,34 +294,34 @@ where
     Ok(())
 }
 
-/// * `initial_threads` is the threads we may spawn, not accounting for our own thread which is still considered used by the parent
-///   system. Since this thread will take a controlling function, we may spawn one more than that. In threaded mode, we will finish
-///   all remaining work.
 #[allow(clippy::too_many_arguments)]
-fn deltas_mt<T, F, MBFN, E, R>(
+fn deltas_mt<F, SINK, E, R, A>(
     mut threads_to_create: isize,
-    decompressed_bytes_by_pack_offset: BTreeMap<u64, (data::Entry, u64, Vec<u8>)>,
+    decompressed_bytes_by_pack_offset: BTreeMap<u64, DecodedDelta>,
     objects: gix_features::progress::StepShared,
     size: gix_features::progress::StepShared,
     progress: &dyn Progress,
-    nodes: Vec<(u16, root::Node<'_, T>)>,
+    nodes: Vec<(u16, root::Node<'_>)>,
     resolve: F,
     resolve_data: &R,
-    modify_base: MBFN,
+    sink: SINK,
     hash_len: usize,
     threads_left: &AtomicIsize,
     should_interrupt: &AtomicBool,
+    memory_budget: MemoryBudget,
+    spool: Arc<SpoolHandle>,
+    accumulator: &A,
 ) -> Result<(), Error>
 where
-    T: Send,
     R: Send + Sync,
     F: for<'r> Fn(EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
-    MBFN: FnMut(&mut T, &dyn Progress, Context<'_>) -> Result<(), E> + Send + Clone,
+    SINK: FnMut(crate::data::Offset, &dyn Progress, Context<'_>, &A) -> Result<(), E> + Send + Clone,
     E: std::error::Error + Send + Sync + 'static,
+    A: Send + Sync,
 {
     let nodes = gix_features::threading::Mutable::new(nodes);
     let decompressed_bytes_by_pack_offset = gix_features::threading::Mutable::new(decompressed_bytes_by_pack_offset);
-    threads_to_create += 1; // ourselves
+    threads_to_create += 1;
     let mut returned_ourselves = false;
 
     gix_features::parallel::threads(|s| -> Result<(), Error> {
@@ -291,9 +335,11 @@ where
                         let nodes = &nodes;
                         let decompressed_bytes_by_pack_offset = &decompressed_bytes_by_pack_offset;
                         let resolve = resolve.clone();
-                        let mut modify_base = modify_base.clone();
                         let objects = &objects;
                         let size = &size;
+                        let memory_budget = memory_budget.clone();
+                        let spool = Arc::clone(&spool);
+                        let mut sink = sink.clone();
 
                         move || -> Result<(), Error> {
                             let mut fully_resolved_delta_bytes = Vec::new();
@@ -312,7 +358,7 @@ where
                                 };
 
                             loop {
-                                let (level, mut base) = match threading::lock(nodes).pop() {
+                                let (level, base) = match threading::lock(nodes).pop() {
                                     Some(v) => v,
                                     None => break,
                                 };
@@ -324,17 +370,16 @@ where
                                     let (a, b) = decompress_from_resolver(base.entry_slice(), &mut buf)?;
                                     (a, b, buf)
                                 } else {
-                                    threading::lock(decompressed_bytes_by_pack_offset)
+                                    let entry = threading::lock(decompressed_bytes_by_pack_offset)
                                         .remove(&base.offset())
-                                        .expect("we store the resolved delta buffer when done")
+                                        .expect("we store the resolved delta buffer when done");
+                                    entry.into_parts()?
                                 };
 
-                                // anything done here must be repeated further down for leaf-nodes.
-                                // This way we avoid retaining their decompressed memory longer than needed (they have no children,
-                                // thus their memory can be released right away, using 18% less peak memory on the linux kernel).
                                 {
-                                    modify_base(
-                                        base.data(),
+                                    let base_offset = base.offset();
+                                    sink(
+                                        base_offset,
                                         progress,
                                         Context {
                                             entry: &base_entry,
@@ -342,13 +387,14 @@ where
                                             decompressed: &base_bytes,
                                             level,
                                         },
+                                        accumulator,
                                     )
                                     .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
                                     objects.fetch_add(1, Ordering::Relaxed);
                                     size.fetch_add(base_bytes.len(), Ordering::Relaxed);
                                 }
 
-                                for mut child in base.into_child_iter() {
+                                for child in base.into_child_iter() {
                                     let (mut child_entry, entry_end) =
                                         decompress_from_resolver(child.entry_slice(), &mut delta_bytes)?;
                                     let (base_size, consumed) = data::delta::decode_header_size(&delta_bytes);
@@ -369,18 +415,22 @@ where
                                         &delta_bytes[header_ofs..],
                                     )?;
 
-                                    // FIXME: this actually invalidates the "pack_offset()" computation, which is not obvious to consumers
-                                    //        at all
-                                    child_entry.header = base_entry.header; // assign the actual object type, instead of 'delta'
+                                    child_entry.header = base_entry.header;
                                     if child.has_children() {
-                                        threading::lock(decompressed_bytes_by_pack_offset).insert(
-                                            child.offset(),
-                                            (child_entry, entry_end, std::mem::take(&mut fully_resolved_delta_bytes)),
-                                        );
+                                        let entry = DecodedDelta::store(
+                                            child_entry,
+                                            entry_end,
+                                            std::mem::take(&mut fully_resolved_delta_bytes),
+                                            &memory_budget,
+                                            &spool,
+                                        )?;
+                                        threading::lock(decompressed_bytes_by_pack_offset)
+                                            .insert(child.offset(), entry);
                                         threading::lock(nodes).push((level + 1, child));
                                     } else {
-                                        modify_base(
-                                            child.data(),
+                                        let child_offset = child.offset();
+                                        sink(
+                                            child_offset,
                                             progress,
                                             Context {
                                                 entry: &child_entry,
@@ -388,6 +438,7 @@ where
                                                 decompressed: &fully_resolved_delta_bytes,
                                                 level: level + 1,
                                             },
+                                            accumulator,
                                         )
                                         .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
                                         objects.fetch_add(1, Ordering::Relaxed);
@@ -412,13 +463,7 @@ where
                 threads_to_create = 0;
             }
 
-            // What we really want to do is either wait for one of our threads to go down
-            // or for another scheduled thread to become available. Unfortunately we can't do that,
-            // but may instead find a good way to set the polling interval instead of hard-coding it.
             std::thread::sleep(poll_interval);
-            // Get out of threads are already starving or they would be starving soon as no work is left.
-            //
-            // Lint: ScopedJoinHandle is not the same depending on active features and is not exposed in some cases.
             #[allow(clippy::redundant_closure_for_method_calls)]
             if threads.iter().any(|t| t.is_finished()) {
                 let mut running_threads = Vec::new();

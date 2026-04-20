@@ -180,6 +180,9 @@ impl ThreadSafeRepository {
             ref api_config_overrides,
             ref cli_config_overrides,
             ref mut current_dir,
+            // memory_budget flows through via `linked_worktree_options: options`
+            // below; no separate destructuring handling is needed here.
+            memory_budget: _,
         } = options;
         let git_dir_trust = git_dir_trust.as_mut().expect("trust must be determined by now");
 

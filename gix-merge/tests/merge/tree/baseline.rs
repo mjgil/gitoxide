@@ -90,7 +90,7 @@ pub struct MergeInfo {
 pub struct Expectation {
     pub root: PathBuf,
     pub conflict_style: gix_merge::blob::builtin_driver::text::ConflictStyle,
-    pub odb: gix_odb::memory::Proxy<gix_odb::Handle>,
+    pub odb: gix_odb::write_proxy::Proxy<gix_odb::Handle>,
     pub our_commit_id: gix_hash::ObjectId,
     pub our_side_name: String,
     pub their_commit_id: gix_hash::ObjectId,
@@ -169,7 +169,7 @@ impl Iterator for Expectations<'_> {
             unknown => unreachable!("Unknown conflict style: '{unknown}'"),
         };
         let odb = gix_odb::at(subdir_path.join(".git/objects")).expect("object dir exists");
-        let objects = gix_odb::memory::Proxy::new(odb, gix_hash::Kind::Sha1);
+        let objects = gix_odb::write_proxy::Proxy::new(odb, gix_hash::Kind::Sha1);
         let our_commit_id = gix_hash::ObjectId::from_hex(our_commit_id.as_bytes()).unwrap();
         let their_commit_id = gix_hash::ObjectId::from_hex(their_commit_id.as_bytes()).unwrap();
         let merge_info = parse_merge_info(std::fs::read_to_string(subdir_path.join(merge_info_filename)).unwrap());
@@ -363,7 +363,7 @@ pub fn show_diff_and_fail(
     actual_id: ObjectId,
     actual: &gix_merge::tree::Outcome<'_>,
     expected: &MergeInfo,
-    odb: &gix_odb::memory::Proxy<gix_odb::Handle>,
+    odb: &gix_odb::write_proxy::Proxy<gix_odb::Handle>,
 ) {
     pretty_assertions::assert_str_eq!(
         visualize_tree(&actual_id, odb, None).to_string(),
@@ -380,7 +380,7 @@ pub fn show_diff_trees_and_fail(
     actual: &gix_merge::tree::Outcome<'_>,
     expected_tree_id: gix_hash::ObjectId,
     additional_information: &str,
-    odb: &gix_odb::memory::Proxy<gix_odb::Handle>,
+    odb: &gix_odb::write_proxy::Proxy<gix_odb::Handle>,
 ) {
     pretty_assertions::assert_str_eq!(
         visualize_tree(&actual_id, odb, None).to_string(),

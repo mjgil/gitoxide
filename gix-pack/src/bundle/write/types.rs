@@ -1,5 +1,6 @@
 use std::{hash::Hash, io, io::SeekFrom, path::PathBuf, sync::Arc};
 
+use gix_features::budget::MemoryBudget;
 use gix_tempfile::handle::Writable;
 
 /// Configuration for [`write_to_directory`][crate::Bundle::write_to_directory()] or
@@ -14,6 +15,32 @@ pub struct Options {
     pub index_version: crate::index::Version,
     /// The kind of hash to use when writing the bundle.
     pub object_hash: gix_hash::Kind,
+    /// Shared memory budget consulted by budget-aware allocation sites
+    /// inside the pack-index build. As of step 5.2 of the
+    /// bounded-memory plan, the first real consumer is the
+    /// delta-chain cache in
+    /// [`cache::delta::traverse::Tree::traverse`][crate::cache::delta::Tree]:
+    /// cached intermediate decoded deltas now reserve bytes against
+    /// this budget, and exceeding the cap returns
+    /// [`cache::delta::traverse::Error::OutOfBudget`][crate::cache::delta::traverse::Error::OutOfBudget]
+    /// rather than growing memory unbounded.
+    ///
+    /// Defaults to [`MemoryBudget::unlimited`] via [`Options::default`],
+    /// preserving pre-budget behaviour byte-for-byte for callers that
+    /// don't opt in. Clone/fetch code in `gix` sets this from
+    /// `Repository::memory_budget()` so a configured `--budget-mb`
+    /// reaches the pack-index path.
+    pub memory_budget: MemoryBudget,
+}
+
+impl Options {
+    /// Replace the configured [`MemoryBudget`] with `budget` and return
+    /// the modified `Options`. Mirrors the `with_*` builder style used
+    /// elsewhere in gix (e.g. `gix::open::Options::with_memory_budget`).
+    pub fn with_memory_budget(mut self, budget: MemoryBudget) -> Self {
+        self.memory_budget = budget;
+        self
+    }
 }
 
 impl Default for Options {
@@ -24,6 +51,7 @@ impl Default for Options {
             iteration_mode: crate::data::input::Mode::Verify,
             index_version: Default::default(),
             object_hash: Default::default(),
+            memory_budget: MemoryBudget::unlimited(),
         }
     }
 }

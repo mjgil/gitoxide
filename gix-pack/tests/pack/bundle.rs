@@ -176,6 +176,7 @@ mod write_to_directory {
                 iteration_mode: pack::data::input::Mode::Verify,
                 index_version: pack::index::Version::V2,
                 object_hash: gix_hash::Kind::Sha1,
+                memory_budget: gix_features::budget::MemoryBudget::unlimited(),
             },
         )
         .map_err(Into::into)

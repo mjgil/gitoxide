@@ -154,6 +154,13 @@ where
             index_version: config::pack_index_version(repo)?,
             iteration_mode: gix_pack::data::input::Mode::Verify,
             object_hash: con.remote.repo.object_hash(),
+            // Thread the repo's shared MemoryBudget into pack-index
+            // build. As of step 5.2 this is load-bearing: the
+            // delta-chain cache inside `Tree::traverse` reserves
+            // against this budget on every cached intermediate
+            // decoded delta, and a clone with a too-tight budget
+            // returns `Error::OutOfBudget` instead of OOM-killing.
+            memory_budget: repo.memory_budget().clone(),
         };
         let mut write_pack_bundle = None;
 

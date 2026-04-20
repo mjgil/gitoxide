@@ -15,6 +15,8 @@
 #![deny(rust_2018_idioms, missing_docs)]
 
 ///
+pub mod budget;
+///
 pub mod cache;
 ///
 pub mod decode;

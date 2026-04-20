@@ -17,6 +17,7 @@ impl Default for Options {
             api_config_overrides: Vec::new(),
             cli_config_overrides: Vec::new(),
             current_dir: None,
+            memory_budget: Default::default(),
         }
     }
 }
@@ -45,6 +46,25 @@ impl Options {
     /// The configuration is marked with [source API][gix_config::Source::Api].
     pub fn config_overrides(mut self, values: impl IntoIterator<Item = impl Into<BString>>) -> Self {
         self.api_config_overrides = values.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Attach a [`MemoryBudget`][gix_features::budget::MemoryBudget] that memory-hot
+    /// operations (pack indexing, delta resolution, object caches) will consult.
+    ///
+    /// Currently this only stores the budget on the resulting [`Repository`]; no call
+    /// site actually enforces it yet. That wiring will land crate-by-crate as the
+    /// bounded-memory work progresses — see [the fork README] for the staged plan.
+    /// Setting a budget today is a no-op with a forward-compatible signature: once
+    /// enforcement lands, the same caller code starts getting bounded behavior.
+    ///
+    /// The default budget (when this method is not called) is
+    /// [`MemoryBudget::unlimited`][gix_features::budget::MemoryBudget::unlimited], so
+    /// uninstrumented callers see no change.
+    ///
+    /// [the fork README]: https://github.com/mjgil/gitx-bounded#readme
+    pub fn with_memory_budget(mut self, budget: gix_features::budget::MemoryBudget) -> Self {
+        self.memory_budget = budget;
         self
     }
 
@@ -169,6 +189,7 @@ impl gix_sec::trust::DefaultForLevel for Options {
                 api_config_overrides: Vec::new(),
                 cli_config_overrides: Vec::new(),
                 current_dir: None,
+                memory_budget: Default::default(),
             },
             gix_sec::Trust::Reduced => Options {
                 object_store_slots: gix_odb::store::init::Slots::Given(32), // limit resource usage
@@ -182,6 +203,7 @@ impl gix_sec::trust::DefaultForLevel for Options {
                 api_config_overrides: Vec::new(),
                 cli_config_overrides: Vec::new(),
                 current_dir: None,
+                memory_budget: Default::default(),
             },
         }
     }

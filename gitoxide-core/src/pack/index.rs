@@ -82,6 +82,11 @@ pub fn from_pack(
         iteration_mode: ctx.iteration_mode.into(),
         index_version: pack::index::Version::default(),
         object_hash: ctx.object_hash,
+        // gitoxide-core has no Repository in scope here. Use
+        // unlimited to preserve pre-budget behaviour; callers who
+        // want a budget should go through `gix` higher up the stack
+        // where a `Repository::memory_budget()` is available.
+        memory_budget: gix::budget::MemoryBudget::unlimited(),
     };
     let out = ctx.out;
     let format = ctx.format;

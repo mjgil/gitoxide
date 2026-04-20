@@ -292,6 +292,7 @@ members = [
     "gix-fsck",
     "tests/tools",
     "tests/it",
+    "mem-harness",
     "gix-diff/tests",
     "gix-pack/tests",
     "gix-odb/tests",

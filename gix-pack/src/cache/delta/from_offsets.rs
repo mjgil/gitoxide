@@ -28,9 +28,9 @@ pub enum Error {
 const PACK_HEADER_LEN: usize = 12;
 
 /// Generate tree from certain input
-impl<T> Tree<T> {
+impl Tree {
     /// Create a new `Tree` from any data sorted by offset, ascending as returned by the `data_sorted_by_offsets` iterator.
-    /// * `get_pack_offset(item: &T) -> data::Offset` is a function returning the pack offset of the given item, which can be used
+    /// * `get_pack_offset(item: &D) -> data::Offset` is a function returning the pack offset of the given item, which can be used
     ///   for obtaining the objects entry within the pack.
     /// * `pack_path` is the path to the pack file itself and from which to read the entry data, which is a pack file matching the offsets
     ///   returned by `get_pack_offset(…)`.
@@ -40,17 +40,17 @@ impl<T> Tree<T> {
     ///   possibility though as old packs might have referred to their objects using the 20 bytes hash, instead of their encoded offset from the base.
     ///
     /// Note that the sort order is ascending. The given pack file path must match the provided offsets.
-    pub fn from_offsets_in_pack(
+    pub fn from_offsets_in_pack<D>(
         pack_path: &std::path::Path,
-        data_sorted_by_offsets: impl Iterator<Item = T>,
-        get_pack_offset: &dyn Fn(&T) -> data::Offset,
+        data_sorted_by_offsets: impl Iterator<Item = D>,
+        get_pack_offset: &dyn Fn(&D) -> data::Offset,
         resolve_in_pack_id: &dyn Fn(&gix_hash::oid) -> Option<data::Offset>,
         progress: &mut dyn Progress,
         should_interrupt: &AtomicBool,
         object_hash: gix_hash::Kind,
     ) -> Result<Self, Error> {
         let mut r = io::BufReader::with_capacity(
-            8192 * 8, // this value directly corresponds to performance, 8k (default) is about 4x slower than 64k
+            8192 * 8,
             fs::File::open(pack_path).map_err(|err| Error::Io {
                 source: err,
                 message: "open pack path",
@@ -64,10 +64,9 @@ impl<T> Tree<T> {
                 progress.init(Some(num_objects), progress::count("objects"));
             })
             .unwrap_or_default();
-        let mut tree = Tree::with_capacity(anticipated_num_objects)?;
+        let mut tree = Tree::with_capacity_unlimited(anticipated_num_objects)?;
 
         {
-            // safety check - assure ourselves it's a pack we can handle
             let mut buf = [0u8; PACK_HEADER_LEN];
             r.read_exact(&mut buf).map_err(|err| Error::Io {
                 source: err,
@@ -95,20 +94,20 @@ impl<T> Tree<T> {
             use crate::data::entry::Header::*;
             match entry.header {
                 Tree | Blob | Commit | Tag => {
-                    tree.add_root(pack_offset, data)?;
+                    tree.add_root(pack_offset)?;
                 }
                 RefDelta { base_id } => {
                     resolve_in_pack_id(base_id.as_ref())
                         .ok_or(Error::UnresolvedRefDelta { id: base_id })
                         .and_then(|base_pack_offset| {
-                            tree.add_child(base_pack_offset, pack_offset, data).map_err(Into::into)
+                            tree.add_child(base_pack_offset, pack_offset).map_err(Into::into)
                         })?;
                 }
                 OfsDelta { base_distance } => {
                     let base_pack_offset = pack_offset
                         .checked_sub(base_distance)
                         .expect("in bound distance for deltas");
-                    tree.add_child(base_pack_offset, pack_offset, data)?;
+                    tree.add_child(base_pack_offset, pack_offset)?;
                 }
             }
             progress.inc();
@@ -137,8 +136,6 @@ impl<T> Tree<T> {
             message: "skip bytes",
         })?;
         if buf.is_empty() {
-            // This means we have reached the end of file and can't make progress anymore, before we have satisfied our need
-            // for more
             return Err(Error::Io {
                 source: io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -148,7 +145,6 @@ impl<T> Tree<T> {
             });
         }
         if bytes_to_skip <= u64::try_from(buf.len()).expect("sensible buffer size") {
-            // SAFETY: bytes_to_skip <= buf.len() <= usize::MAX
             r.consume(bytes_to_skip as usize);
         } else {
             r.seek(SeekFrom::Start(pack_offset)).map_err(|err| Error::Io {

@@ -20,4 +20,13 @@ pub enum Error {
     Tree(#[from] crate::cache::delta::Error),
     #[error(transparent)]
     TreeTraversal(#[from] crate::cache::delta::traverse::Error),
+    /// Propagated from the external merge sort used to produce the
+    /// sorted-by-id entry stream consumed by
+    /// [`crate::index::encode::write_to`]. Carries either a spool
+    /// I/O error (disk full, `$TMPDIR` inaccessible) or
+    /// [`OutOfBudget`][gix_features::budget::OutOfBudget] when the
+    /// shared memory budget cannot accommodate even a minimum-size
+    /// sort chunk. Step 5.4b-2 of the bounded-memory plan.
+    #[error(transparent)]
+    ExternalSort(#[from] super::external_sort::Error),
 }

@@ -37,6 +37,12 @@ pub struct Options {
     pub(crate) open_path_as_is: bool,
     /// Internal to pass an already obtained CWD on to where it may also be used. This avoids the CWD being queried more than once per repo.
     pub(crate) current_dir: Option<PathBuf>,
+    /// Cooperative byte-budget for memory-hot operations (pack indexing, delta resolution,
+    /// object caches). Set via [`Options::with_memory_budget`]; defaults to
+    /// [`gix_features::budget::MemoryBudget::unlimited`], which preserves pre-existing
+    /// behavior. Not enforced yet — call sites will consult this as the bounded-memory
+    /// work lands.
+    pub(crate) memory_budget: gix_features::budget::MemoryBudget,
 }
 
 /// The error returned by [`crate::open()`].

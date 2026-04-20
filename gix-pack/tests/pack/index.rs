@@ -158,6 +158,7 @@ mod version {
                     &AtomicBool::new(false),
                     gix_hash::Kind::Sha1,
                     pack_version,
+                    gix_features::budget::MemoryBudget::unlimited(),
                 )?;
 
                 let expected = fs::read(fixture_path(index_path))?;
@@ -233,6 +234,128 @@ mod version {
             let mut candidates = 1..1;
             assert!(file.lookup_prefix(prefix, Some(&mut candidates)).is_none());
             assert_eq!(candidates, 0..0);
+        }
+
+        /// Step 5.3 of the bounded-memory plan. A deliberately tight
+        /// [`MemoryBudget`] (here: zero bytes) must cause the delta-
+        /// chain cache to spill every intermediate-delta entry to an
+        /// on-disk tempfile rather than holding them in RAM. The
+        /// index build must complete successfully and produce a
+        /// byte-identical result to the unlimited-budget run — this
+        /// is the end-to-end correctness proof that spill-to-disk
+        /// does not alter the output.
+        ///
+        /// Before step 5.3 this test was
+        /// `tight_memory_budget_aborts_with_out_of_budget` and
+        /// asserted `Err(Error::OutOfBudget(_))`. The 5.3 contract
+        /// change (fail-fast → spill-to-disk) inverts that
+        /// expectation: 0-byte budgets must now succeed.
+        ///
+        /// The `OutOfBudget` variant still exists in the error enum
+        /// for other consumers of the budget (and for a future
+        /// "strict mode" where spill is disabled), but the
+        /// delta-chain cache inside `resolve::deltas` / `deltas_mt`
+        /// never returns it anymore — it returns either `Ok(_)` with
+        /// bytes on disk, or [`Error::SpoolIo`] if the spool itself
+        /// can't be written.
+        #[test]
+        fn tight_memory_budget_spills_to_disk_and_matches_unlimited(
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            use crate::pack::PACK_FOR_INDEX_V2;
+
+            // Two independent runs over the same fixture, one with
+            // unlimited budget (the classical in-RAM path) and one
+            // with a 0-byte cap that forces every intermediate delta
+            // through the spool. The two output byte streams must be
+            // identical.
+            let run = |budget: gix_features::budget::MemoryBudget| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                let mut pack_iter = pack::data::input::BytesToEntriesIter::new_from_header(
+                    io::BufReader::new(fs::File::open(fixture_path(PACK_FOR_INDEX_V2))?),
+                    input::Mode::Verify,
+                    input::EntryDataMode::Crc32,
+                    gix_hash::Kind::Sha1,
+                )?;
+                let mut actual = Vec::<u8>::new();
+                let pack_version = pack_iter.version();
+                let outcome = pack::index::File::write_data_iter_to_stream(
+                    pack::index::Version::default(),
+                    || {
+                        let file = std::fs::File::open(fixture_path(PACK_FOR_INDEX_V2))?;
+                        let map = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file)? };
+                        Ok((slice_map, map))
+                    },
+                    &mut pack_iter,
+                    None,
+                    &mut progress::Discard,
+                    &mut actual,
+                    &AtomicBool::new(false),
+                    gix_hash::Kind::Sha1,
+                    pack_version,
+                    budget,
+                )?;
+                assert!(
+                    outcome.num_objects > 0,
+                    "fixture should contain at least one object"
+                );
+                Ok(actual)
+            };
+
+            let unlimited = run(gix_features::budget::MemoryBudget::unlimited())?;
+            let tight = run(gix_features::budget::MemoryBudget::bytes(0))?;
+
+            assert_eq!(
+                tight.len(),
+                unlimited.len(),
+                "tight-budget (spill-to-disk) index must have same length as unlimited-budget index"
+            );
+            assert_eq!(
+                tight, unlimited,
+                "tight-budget (spill-to-disk) index must be byte-for-byte identical to unlimited-budget index \
+                 — if this fails, step 5.3's DecodedDelta::store -> into_parts roundtrip is corrupting bytes"
+            );
+            Ok(())
+        }
+
+        /// Under [`MemoryBudget::unlimited`] the build must complete
+        /// successfully and produce the same object count it does
+        /// without any budget configured — proves the unlimited path
+        /// is byte-for-byte unchanged by step 5.2.
+        #[test]
+        fn unlimited_memory_budget_completes_same_as_before() -> Result<(), Box<dyn std::error::Error>> {
+            use crate::pack::PACK_FOR_INDEX_V2;
+
+            let mut pack_iter = pack::data::input::BytesToEntriesIter::new_from_header(
+                io::BufReader::new(fs::File::open(fixture_path(PACK_FOR_INDEX_V2))?),
+                input::Mode::Verify,
+                input::EntryDataMode::Crc32,
+                gix_hash::Kind::Sha1,
+            )?;
+            let expected_objects = pack_iter.len() as u32;
+            let mut actual = Vec::<u8>::new();
+            let pack_version = pack_iter.version();
+
+            let outcome = pack::index::File::write_data_iter_to_stream(
+                pack::index::Version::default(),
+                || {
+                    let file = std::fs::File::open(fixture_path(PACK_FOR_INDEX_V2))?;
+                    let map = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file)? };
+                    Ok((slice_map, map))
+                },
+                &mut pack_iter,
+                None,
+                &mut progress::Discard,
+                &mut actual,
+                &AtomicBool::new(false),
+                gix_hash::Kind::Sha1,
+                pack_version,
+                gix_features::budget::MemoryBudget::unlimited(),
+            )?;
+
+            assert_eq!(
+                outcome.num_objects, expected_objects,
+                "unlimited budget must not change object count vs pre-5.2 behaviour"
+            );
+            Ok(())
         }
     }
 }

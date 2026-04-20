@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gix_features::{
+    budget::MemoryBudget,
     parallel::in_parallel_with_slice,
     progress::{self, DynNestedProgress, Progress},
     threading,
@@ -8,12 +9,12 @@ use gix_features::{
 };
 
 use crate::{
-    cache::delta::{traverse::util::ItemSliceSync, Item, Tree},
+    cache::delta::Tree,
     data::EntryRange,
 };
 
 mod resolve;
-pub(crate) mod util;
+pub(crate) mod spool;
 
 /// Returned by [`Tree::traverse()`]
 #[derive(thiserror::Error, Debug)]
@@ -43,9 +44,34 @@ pub enum Error {
     SpawnThread(#[from] std::io::Error),
     #[error(transparent)]
     Delta(#[from] crate::data::delta::apply::Error),
+    /// The delta-chain cache inside the traversal tried to reserve more
+    /// bytes from the shared [`MemoryBudget`] than were available.
+    ///
+    /// Step 5.2 of the bounded-memory plan. Callers who see this should
+    /// retry with a wider budget (or with
+    /// [`MemoryBudget::unlimited`][gix_features::budget::MemoryBudget::unlimited]
+    /// to disable budgeting entirely); the state visible to them on
+    /// failure is clean — every cached intermediate delta has been
+    /// dropped, releasing its accounted bytes.
+    #[error(transparent)]
+    OutOfBudget(#[from] gix_features::budget::OutOfBudget),
+    /// The delta-chain cache tried to spill bytes to an on-disk spool
+    /// (because the shared [`MemoryBudget`] was exhausted) and the
+    /// underlying I/O failed — typically "no space left on device" or
+    /// "permission denied on `$TMPDIR`".
+    ///
+    /// Step 5.3 of the bounded-memory plan. Unlike
+    /// [`Error::OutOfBudget`] this is a hard failure: there is no
+    /// in-RAM or on-disk fallback beyond the spool, so the traversal
+    /// cannot continue. State on failure is clean: scoped threads in
+    /// [`resolve::deltas_mt`] unwind, the shared cache map drops,
+    /// every `Reservation` drops, and the (partially-written) spool
+    /// file is closed and unlinked by the kernel.
+    #[error("delta-chain cache spill-to-disk failed")]
+    SpoolIo(#[source] std::io::Error),
 }
 
-/// Additional context passed to the `inspect_object(…)` function of the [`Tree::traverse()`] method.
+/// Additional context passed to the `sink` callback of the [`Tree::traverse()`] method.
 pub struct Context<'a> {
     /// The pack entry describing the object
     pub entry: &'a crate::data::Entry,
@@ -72,58 +98,78 @@ pub struct Options<'a, 's> {
     /// specifies what kind of hashes we expect to be stored in oid-delta entries, which is viable to decoding them
     /// with the correct size.
     pub object_hash: gix_hash::Kind,
+    /// Shared memory budget consulted by budget-aware allocation sites
+    /// inside the traversal.
+    ///
+    /// As of step 5.2 of the bounded-memory plan, this is load-bearing:
+    /// the `decompressed_bytes_by_pack_offset` delta-chain cache in
+    /// `resolve::deltas` and `resolve::deltas_mt` reserves bytes
+    /// against this budget on every cached intermediate delta. If the
+    /// budget is exhausted mid-traversal the whole operation returns
+    /// [`Error::OutOfBudget`] cleanly; callers retry with a wider
+    /// budget or with [`MemoryBudget::unlimited`].
+    ///
+    /// Use [`MemoryBudget::unlimited`] when you don't care — this
+    /// preserves pre-budget behaviour byte-for-byte.
+    pub memory_budget: MemoryBudget,
 }
 
-/// The outcome of [`Tree::traverse()`]
-pub struct Outcome<T> {
-    /// The items that have no children in the pack, i.e. base objects.
-    pub roots: Vec<Item<T>>,
-    /// The items that children to a root object, i.e. delta objects.
-    pub children: Vec<Item<T>>,
-}
-
-impl<T> Tree<T>
-where
-    T: Send,
-{
-    /// Traverse this tree of delta objects with a function `inspect_object` to process each object at will.
+impl Tree {
+    /// Traverse this tree of delta objects, calling `sink` for each resolved object.
     ///
-    /// * `should_run_in_parallel() -> bool` returns true if the underlying pack is big enough to warrant parallel traversal at all.
-    /// * `resolve(EntrySlice, &mut Vec<u8>) -> Option<()>` resolves the bytes in the pack for the given `EntrySlice` and stores them in the
-    ///   output vector. It returns `Some(())` if the object existed in the pack, or `None` to indicate a resolution error, which would abort the
-    ///   operation as well.
-    /// * `pack_entries_end` marks one-past-the-last byte of the last entry in the pack, as the last entries size would otherwise
-    ///   be unknown as it's not part of the index file.
-    /// * `inspect_object(node_data: &mut T, progress: Progress, context: Context<ThreadLocal State>) -> Result<(), CustomError>` is a function
-    ///   running for each thread receiving fully decoded objects along with contextual information, which either succeeds with `Ok(())`
-    ///   or returns a `CustomError`.
-    ///   Note that `node_data` can be modified to allow storing maintaining computation results on a per-object basis. It should contain
-    ///   its own mutable per-thread data as required.
+    /// * `resolve(EntrySlice, &R) -> Option<&[u8]>` resolves the bytes in the pack for the given
+    ///   `EntrySlice`. It returns `Some(bytes)` if the object existed in the pack, or `None` to
+    ///   indicate a resolution error, which aborts the operation.
+    /// * `pack_entries_end` marks one-past-the-last byte of the last entry in the pack, as the
+    ///   last entry's size would otherwise be unknown (it's not part of the index file).
+    /// * `sink(offset, progress, context, accumulator)` is called exactly once per resolved
+    ///   object. The `accumulator` is per-worker state created by `new_accumulator` — one
+    ///   instance per worker thread. The sink receives `&A` (shared ref) because work-stealing
+    ///   sub-threads within a single root tree share the same accumulator; use interior
+    ///   mutability (e.g. `Mutex`) if the accumulator needs mutation.
+    /// * `new_accumulator` is called once per worker thread to create the per-worker
+    ///   accumulator. After traversal, all accumulators are returned as `Vec<A>`.
     ///
-    /// This method returns a vector of all tree items, along with their potentially modified custom node data.
-    ///
-    /// _Note_ that this method consumed the Tree to assure safe parallel traversal with mutation support.
-    pub fn traverse<F, MBFN, E, R>(
+    /// _Note_ that this method consumes the Tree to assure safe parallel traversal.
+    pub fn traverse<F, SINK, E, R, A>(
         mut self,
         resolve: F,
         resolve_data: &R,
         pack_entries_end: u64,
-        inspect_object: MBFN,
+        sink: SINK,
+        new_accumulator: impl FnOnce() -> A + Send + Clone,
         Options {
             thread_limit,
             mut object_progress,
             size_progress,
             should_interrupt,
             object_hash,
+            memory_budget,
         }: Options<'_, '_>,
-    ) -> Result<Outcome<T>, Error>
+    ) -> Result<Vec<A>, Error>
     where
         F: for<'r> Fn(EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
         R: Send + Sync,
-        MBFN: FnMut(&mut T, &dyn Progress, Context<'_>) -> Result<(), E> + Send + Clone,
+        SINK: FnMut(crate::data::Offset, &dyn Progress, Context<'_>, &A) -> Result<(), E> + Send + Clone,
         E: std::error::Error + Send + Sync + 'static,
+        A: Send + Sync,
     {
         self.set_pack_entries_end_and_resolve_ref_offsets(pack_entries_end)?;
+
+        // `memory_budget` is consumed below by the resolve::State
+        // factory closure; each worker clones the same Arc-backed
+        // counter into its own State so the cap applies across
+        // cooperating threads. Step 5.2 of the bounded-memory plan.
+        //
+        // Step 5.3: a shared `SpoolHandle` rides alongside the
+        // budget. It is created eagerly here as an `Arc<SpoolHandle>`
+        // so every worker sees the same lazy slot — the first worker
+        // to exhaust its budget opens the underlying tempfile; all
+        // other workers reuse it. Under [`MemoryBudget::unlimited`]
+        // no worker ever needs to spill and the handle's
+        // `Option<Arc<SpoolFile>>` stays `None`, so the only cost is
+        // one Mutex-wrapped `Option` per worker.
+        let spool = std::sync::Arc::new(spool::SpoolHandle::new());
 
         let num_objects = self.num_items();
         let object_counter = {
@@ -136,15 +182,32 @@ where
         let object_progress = OwnShared::new(Mutable::new(object_progress));
 
         let start = std::time::Instant::now();
-        let (mut root_items, mut child_items_vec) = self.take_root_and_child();
-        let child_items = ItemSliceSync::new(&mut child_items_vec);
-        let child_items = &child_items;
-        in_parallel_with_slice(
-            &mut root_items,
+        let (store, is_root) = self.take_store_and_is_root();
+        let num_items = store.num_items() as usize;
+        debug_assert_eq!(is_root.len(), num_items);
+        let metadata_owned = store.metadata();
+        let metadata = &metadata_owned;
+        // Root indices are the traversal unit: each worker pulls
+        // a `&mut u32` root idx from the slice, builds a fresh
+        // `Node` via the shared `metadata` + `data`, and runs
+        // `resolve::deltas`. Derived from `is_root` since roots
+        // and children interleave in the store's pack-offset
+        // layout — they are NOT at indices `0..num_roots`.
+        let mut root_indices: Vec<u32> = is_root
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &r)| r.then_some(i as u32))
+            .collect();
+        let accumulators = in_parallel_with_slice(
+            &mut root_indices,
             thread_limit,
             {
                 {
                     let object_progress = object_progress.clone();
+                    let memory_budget = memory_budget.clone();
+                    let spool = std::sync::Arc::clone(&spool);
+                    let sink = sink.clone();
+                    let new_accumulator = new_accumulator.clone();
                     move |thread_index| resolve::State {
                         delta_bytes: Vec::<u8>::with_capacity(4096),
                         fully_resolved_delta_bytes: Vec::<u8>::with_capacity(4096),
@@ -152,22 +215,27 @@ where
                             threading::lock(&object_progress).add_child(format!("thread {thread_index}")),
                         ),
                         resolve: resolve.clone(),
-                        modify_base: inspect_object.clone(),
-                        child_items,
+                        metadata,
+                        memory_budget: memory_budget.clone(),
+                        spool: std::sync::Arc::clone(&spool),
+                        sink: sink.clone(),
+                        accumulator: new_accumulator(),
                     }
                 }
             },
             {
-                move |node, state, threads_left, should_interrupt| {
-                    // SAFETY: This invariant is upheld since `child_items` and `node` come from the same Tree.
-                    // This means we can rely on Tree's invariant that node.children will be the only `children` array in
-                    // for nodes in this tree that will contain any of those children.
+                move |root_idx, state, threads_left, should_interrupt| {
+                    // SAFETY: `root_idx` comes from the Vec<u32> built above;
+                    // `metadata` and `data` carry the same lifetime as the
+                    // store the roots belong to. The delta-tree's one-parent-
+                    // per-child property guarantees `get_mut(idx)` uniqueness
+                    // across workers.
                     #[allow(unsafe_code)]
                     unsafe {
                         resolve::deltas(
                             object_counter.clone(),
                             size_counter.clone(),
-                            node,
+                            root_idx,
                             state,
                             resolve_data,
                             object_hash.len_in_bytes(),
@@ -178,15 +246,17 @@ where
                 }
             },
             || (!should_interrupt.load(Ordering::Relaxed)).then(|| std::time::Duration::from_millis(50)),
-            |_| (),
+            |s| s.accumulator,
         )?;
 
         threading::lock(&object_progress).show_throughput(start);
         size_progress.show_throughput(start);
 
-        Ok(Outcome {
-            roots: root_items,
-            children: child_items_vec,
-        })
+        let _ = metadata_owned;
+        drop(store);
+        let _ = is_root;
+        let _ = root_indices;
+        let _ = num_items;
+        Ok(accumulators)
     }
 }

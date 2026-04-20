@@ -59,7 +59,7 @@ impl index::File {
     pub fn traverse_with_index<Processor, E>(
         &self,
         pack: &crate::data::File,
-        mut processor: Processor,
+        processor: Processor,
         progress: &mut dyn DynNestedProgress,
         should_interrupt: &AtomicBool,
         Options { check, thread_limit }: Options,
@@ -102,59 +102,82 @@ impl index::File {
                         "collecting sorted index".into(),
                         ProgressId::CollectSortedIndexEntries.into(),
                     ),
-                ); /* Pack Traverse Collect sorted Entries */
+                );
                 let tree = crate::cache::delta::Tree::from_offsets_in_pack(
                     pack.path(),
-                    sorted_entries.into_iter().map(Entry::from),
-                    &|e| e.index_entry.pack_offset,
+                    sorted_entries.iter().cloned(),
+                    &|e: &index::Entry| e.pack_offset,
                     &|id| self.lookup(id).map(|idx| self.pack_offset_at_index(idx)),
                     &mut progress.add_child_with_id("indexing".into(), ProgressId::TreeFromOffsetsObjects.into()),
                     should_interrupt,
                     self.object_hash,
                 )?;
-                let mut outcome = digest_statistics(tree.traverse(
+                let stats = std::sync::Mutex::new(index::traverse::Statistics::default());
+                let num_nodes_counter = std::sync::atomic::AtomicU64::new(0);
+                let processor = std::sync::Mutex::new(processor);
+                tree.traverse(
                     |slice, pack| pack.entry_slice(slice),
                     pack,
                     pack.pack_end() as u64,
-                    move |data,
-                          progress,
-                          traverse::Context {
-                              entry: pack_entry,
-                              entry_end,
-                              decompressed: bytes,
-                              level,
-                          }| {
+                    |offset: crate::data::Offset,
+                     progress: &dyn gix_features::progress::Progress,
+                     traverse::Context {
+                         entry: pack_entry,
+                         entry_end,
+                         decompressed: bytes,
+                         level,
+                     },
+                     _acc: &()|
+                     -> Result<(), Error<E>> {
                         let object_kind = pack_entry.header.as_kind().expect("non-delta object");
-                        data.level = level;
-                        data.decompressed_size = pack_entry.decompressed_size;
-                        data.object_kind = object_kind;
-                        data.compressed_size = entry_end - pack_entry.data_offset;
-                        data.object_size = bytes.len() as u64;
+                        let index_entry = sorted_entries
+                            .binary_search_by_key(&offset, |e| e.pack_offset)
+                            .map(|i| &sorted_entries[i])
+                            .expect("every traversed offset has a matching index entry");
+                        let compressed_size = entry_end - pack_entry.data_offset;
+                        let decompressed_size = pack_entry.decompressed_size;
+                        let object_size = bytes.len() as u64;
                         let result = index::traverse::process_entry(
                             check,
                             object_kind,
                             bytes,
-                            &data.index_entry,
+                            index_entry,
                             || {
-                                // TODO: Fix this - we overwrite the header of 'data' which also changes the computed entry size,
-                                // causing index and pack to seemingly mismatch. This is surprising, and should be done differently.
-                                // debug_assert_eq!(&data.index_entry.pack_offset, &pack_entry.pack_offset());
                                 gix_features::hash::crc32(
-                                    pack.entry_slice(data.index_entry.pack_offset..entry_end)
+                                    pack.entry_slice(index_entry.pack_offset..entry_end)
                                         .expect("slice pointing into the pack (by now data is verified)"),
                                 )
                             },
                             progress,
-                            &mut processor,
+                            &mut *processor.lock().expect("processor mutex must not be poisoned"),
                         );
                         match result {
                             Err(err @ Error::PackDecode { .. }) if !check.fatal_decode_error() => {
                                 progress.info(format!("Ignoring decode error: {err}"));
-                                Ok(())
                             }
-                            res => res,
+                            Err(e) => return Err(e),
+                            Ok(()) => {}
                         }
+                        num_nodes_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut s = stats.lock().expect("stats mutex must not be poisoned");
+                        s.total_compressed_entries_size += compressed_size;
+                        s.total_decompressed_entries_size += decompressed_size;
+                        s.total_object_size += object_size;
+                        *s.objects_per_chain_length.entry(u32::from(level)).or_insert(0) += 1;
+                        s.average.decompressed_size += decompressed_size;
+                        s.average.compressed_size += compressed_size as usize;
+                        s.average.object_size += object_size;
+                        s.average.num_deltas += u32::from(level);
+                        use gix_object::Kind::*;
+                        match object_kind {
+                            Blob => s.num_blobs += 1,
+                            Tree => s.num_trees += 1,
+                            Tag => s.num_tags += 1,
+                            Commit => s.num_commits += 1,
+                        }
+                        Ok(())
                     },
+                    || (),
                     traverse::Options {
                         object_progress: Box::new(
                             progress.add_child_with_id("Resolving".into(), ProgressId::DecodedObjects.into()),
@@ -164,8 +187,15 @@ impl index::File {
                         thread_limit,
                         should_interrupt,
                         object_hash: self.object_hash,
+                        memory_budget: gix_features::budget::MemoryBudget::unlimited(),
                     },
-                )?);
+                )?;
+                let mut outcome = stats
+                    .into_inner()
+                    .expect("stats mutex must not be poisoned on into_inner");
+                let num_nodes =
+                    num_nodes_counter.load(std::sync::atomic::Ordering::Relaxed) as usize;
+                finalize_statistics_averages(&mut outcome, num_nodes);
                 outcome.pack_size = pack.data_len() as u64;
                 Ok(outcome)
             },
@@ -177,57 +207,9 @@ impl index::File {
     }
 }
 
-struct Entry {
-    index_entry: crate::index::Entry,
-    object_kind: gix_object::Kind,
-    object_size: u64,
-    decompressed_size: u64,
-    compressed_size: u64,
-    level: u16,
-}
-
-impl From<crate::index::Entry> for Entry {
-    fn from(index_entry: crate::index::Entry) -> Self {
-        Entry {
-            index_entry,
-            level: 0,
-            object_kind: gix_object::Kind::Tree,
-            object_size: 0,
-            decompressed_size: 0,
-            compressed_size: 0,
-        }
-    }
-}
-
-fn digest_statistics(traverse::Outcome { roots, children }: traverse::Outcome<Entry>) -> index::traverse::Statistics {
-    let mut res = index::traverse::Statistics::default();
-    let average = &mut res.average;
-    for item in roots.iter().chain(children.iter()) {
-        res.total_compressed_entries_size += item.data.compressed_size;
-        res.total_decompressed_entries_size += item.data.decompressed_size;
-        res.total_object_size += item.data.object_size;
-        *res.objects_per_chain_length
-            .entry(u32::from(item.data.level))
-            .or_insert(0) += 1;
-
-        average.decompressed_size += item.data.decompressed_size;
-        average.compressed_size += item.data.compressed_size as usize;
-        average.object_size += item.data.object_size;
-        average.num_deltas += u32::from(item.data.level);
-        use gix_object::Kind::*;
-        match item.data.object_kind {
-            Blob => res.num_blobs += 1,
-            Tree => res.num_trees += 1,
-            Tag => res.num_tags += 1,
-            Commit => res.num_commits += 1,
-        }
-    }
-
-    let num_nodes = roots.len() + children.len();
-    average.decompressed_size /= num_nodes as u64;
-    average.compressed_size /= num_nodes;
-    average.object_size /= num_nodes as u64;
-    average.num_deltas /= num_nodes as u32;
-
-    res
+fn finalize_statistics_averages(stats: &mut index::traverse::Statistics, num_nodes: usize) {
+    stats.average.decompressed_size /= num_nodes as u64;
+    stats.average.compressed_size /= num_nodes;
+    stats.average.object_size /= num_nodes as u64;
+    stats.average.num_deltas /= num_nodes as u32;
 }

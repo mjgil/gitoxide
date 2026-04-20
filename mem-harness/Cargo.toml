@@ -1,0 +1,22 @@
+lints.workspace = true
+
+[package]
+name = "mem-harness"
+description = "Peak-RSS benchmark harness for gix clone/fetch. Reports peak memory use of a single clone, to ground the bounded-memory work in measurement instead of speculation."
+version = "0.0.0"
+authors = ["gitx-bounded"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version = "1.82"
+
+[[bin]]
+name = "mem-harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+gix = { path = "../gix", default-features = false, features = ["blocking-network-client", "worktree-mutation", "sha1"] }
+libc = "0.2"
+walkdir = "2"

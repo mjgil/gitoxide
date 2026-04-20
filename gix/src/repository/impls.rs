@@ -49,7 +49,7 @@ impl From<&crate::ThreadSafeRepository> for crate::Repository {
     fn from(repo: &crate::ThreadSafeRepository) -> Self {
         crate::Repository::from_refs_and_objects(
             repo.refs.clone(),
-            gix_odb::memory::Proxy::from(gix_odb::Cache::from(repo.objects.to_handle())).with_write_passthrough(),
+            gix_odb::write_proxy::Proxy::from(gix_odb::Cache::from(repo.objects.to_handle())).with_write_passthrough(),
             repo.work_tree.clone(),
             repo.common_dir.clone(),
             repo.config.clone(),
@@ -67,7 +67,7 @@ impl From<crate::ThreadSafeRepository> for crate::Repository {
     fn from(repo: crate::ThreadSafeRepository) -> Self {
         crate::Repository::from_refs_and_objects(
             repo.refs,
-            gix_odb::memory::Proxy::from(gix_odb::Cache::from(repo.objects.to_handle())).with_write_passthrough(),
+            gix_odb::write_proxy::Proxy::from(gix_odb::Cache::from(repo.objects.to_handle())).with_write_passthrough(),
             repo.work_tree,
             repo.common_dir,
             repo.config,

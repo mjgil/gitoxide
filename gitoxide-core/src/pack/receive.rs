@@ -289,6 +289,9 @@ fn receive_pack_blocking(
         index_version: pack::index::Version::V2,
         iteration_mode: pack::data::input::Mode::Verify,
         object_hash,
+        // gitoxide-core has no Repository in scope here. Use
+        // unlimited to preserve pre-budget behaviour.
+        memory_budget: gix::budget::MemoryBudget::unlimited(),
     };
     let outcome = pack::Bundle::write_to_directory(
         &mut input,

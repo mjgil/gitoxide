@@ -101,7 +101,7 @@ pub fn sink(object_hash: gix_hash::Kind) -> Sink {
 }
 
 ///
-pub mod memory;
+pub mod write_proxy;
 
 mod sink;
 

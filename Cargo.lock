@@ -2147,6 +2147,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "smallvec",
+ "tempfile",
  "thiserror 2.0.18",
  "uluru",
 ]
@@ -3522,6 +3523,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "mem-harness"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gix",
+ "libc",
+ "walkdir",
 ]
 
 [[package]]

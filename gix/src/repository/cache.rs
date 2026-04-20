@@ -12,9 +12,18 @@ impl crate::Repository {
         let bytes = bytes.into();
         match bytes {
             Some(0) => self.objects.unset_object_cache(),
-            Some(bytes) => self
-                .objects
-                .set_object_cache(move || Box::new(crate::object::cache::MemoryCappedHashmap::new(bytes))),
+            Some(bytes) => {
+                // Clone the repository's shared budget into the closure so
+                // the cache this call installs participates in the same
+                // accounting as the one installed via `setup_objects`.
+                let budget = self.options.memory_budget.clone();
+                self.objects.set_object_cache(move || {
+                    Box::new(crate::object::cache::MemoryCappedHashmap::with_memory_budget(
+                        bytes,
+                        budget.clone(),
+                    ))
+                });
+            }
             None => self.objects.unset_object_cache(),
         }
     }

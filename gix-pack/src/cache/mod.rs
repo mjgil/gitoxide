@@ -54,6 +54,18 @@ pub mod object;
 ///
 pub(crate) mod delta;
 
+/// Re-export of the delta-tree traversal submodule so that its public
+/// types — notably [`traverse::Error`] and its
+/// [`traverse::Error::OutOfBudget`][`gix_features::budget::OutOfBudget`]
+/// variant — are reachable by external callers and by tests.
+///
+/// The underlying [`delta`] module holds internal data structures
+/// (the delta-tree acceleration layout) that are not intended for
+/// public consumption and therefore remain `pub(crate)`. Only the
+/// `traverse` surface is promoted to `pub` here, matching the
+/// purely-additive philosophy of the bounded-memory plan.
+pub use delta::traverse;
+
 /// Replaces content of the given `Vec` with the slice. The vec will have the same length
 /// as the slice. The vec can be either `&mut Vec` or `Vec`.
 /// Returns `None` if no memory could be allocated.

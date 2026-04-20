@@ -101,15 +101,15 @@ fn with_memory() -> crate::Result {
     Ok(())
 }
 
-fn db() -> crate::Result<gix_odb::memory::Proxy<gix_odb::Handle>> {
+fn db() -> crate::Result<gix_odb::write_proxy::Proxy<gix_odb::Handle>> {
     let odb = gix_odb::at(
         gix_testtools::scripted_fixture_read_only_standalone("repo_with_loose_objects.sh")?.join(".git/objects"),
     )?;
-    Ok(gix_odb::memory::Proxy::new(odb, gix_hash::Kind::Sha1))
+    Ok(gix_odb::write_proxy::Proxy::new(odb, gix_hash::Kind::Sha1))
 }
 
-fn db_rw() -> crate::Result<(gix_odb::memory::Proxy<gix_odb::Handle>, TempDir)> {
+fn db_rw() -> crate::Result<(gix_odb::write_proxy::Proxy<gix_odb::Handle>, TempDir)> {
     let tmp = gix_testtools::scripted_fixture_writable_standalone("repo_with_loose_objects.sh")?;
     let odb = gix_odb::at(tmp.path().join(".git/objects"))?;
-    Ok((gix_odb::memory::Proxy::new(odb, gix_hash::Kind::Sha1), tmp))
+    Ok((gix_odb::write_proxy::Proxy::new(odb, gix_hash::Kind::Sha1), tmp))
 }

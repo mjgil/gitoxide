@@ -297,7 +297,7 @@ impl crate::Repository {
             || b != self.config.pack_cache_bytes
             || c != self.config.object_cache_bytes
         {
-            setup_objects(&mut self.objects, &self.config);
+            setup_objects(&mut self.objects, &self.config, &self.options.memory_budget);
         }
         Ok(())
     }
